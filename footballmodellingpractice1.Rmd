@@ -1,0 +1,559 @@
+---
+title: "Football Analysis and Modelling"
+author: "Ian"
+date: "2023-01-13"
+output:
+  html_document: default
+  pdf_document: 
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_knit$set(root.dir = "OneDrive - University College London/Postgrad/Masters/Kaggle practice/Beginner/")
+
+```
+
+```{r data via api}
+library(httr)
+#install.packages('devtools')
+#install.packages("worldfootballR")
+library(worldfootballR)
+library(tidyverse)
+
+data1 <- worldfootballR::fb_match_results(country = "ENG", gender = "M", season_end_year = c(2019:2022))
+
+## Simple exploration 
+head(data1)
+colnames(data1)
+
+## Check dates
+range(data1$Date) ## Games from 2018 to 2021
+
+## Subset columns of interest 
+#data2 <- data1 %>% select(Season_End_Year, Date, starts_with("Home"), starts_with("Away"), Referee)
+
+## Referees over the years
+#data2 %>% group_by(Referee, Season_End_Year) %>% summarise(count = n())
+```
+
+```{r data cleanup, include=FALSE}
+summary(data1)
+str(data1)
+
+## Convert some columns to factors
+data1 <- data1 %>% mutate(Week = as.numeric(Wk),
+                          Time = as.POSIXct(Time, format = "%H:%M"), 
+                          Home = as.factor(Home), 
+                          Away = as.factor(Away),
+                          Referee = as.factor(Referee))
+
+### ADD SOME METRICS 
+data1 <-   data1 %>% mutate(Total_goals = HomeGoals+AwayGoals)
+```
+
+
+```{r basic data exploration}
+## Number of games each season
+data1 %>% group_by(Season_End_Year) %>% count()
+
+## Get the unique teams
+data1 %>% dplyr::select(Home) %>% unique()
+# - this code can be written in a more concise way using distinct()
+data1 %>% distinct(Home)
+
+## Colnames 
+colnames(data1) # - interesting variables are Home xG and Away xG 
+
+## Compare XG to actual goals?
+data1 %>% dplyr::select(Home, Away, HomeGoals, AwayGoals, Home_xG, Away_xG, Season_End_Year) %>% head()
+
+## Upsets? Games where sign of (homexg - awayxg) is different from (home - away)
+data_upsets <- data1 %>% 
+  dplyr::select(Home, Away, HomeGoals, AwayGoals, Home_xG, Away_xG, Season_End_Year) %>% 
+  mutate(`homexg-awayxg` = Home_xG -Away_xG,
+                 `home-away` = HomeGoals -AwayGoals) %>% 
+  mutate(upset = round(`home-away`/ (`homexg-awayxg` + 0.01))) %>%
+  mutate(upset = replace_na(upset, 0)) %>% 
+  rename(`actualtopredicted` = upset)
+
+#- check
+data_upsets %>% dplyr::select(actualtopredicted) %>% head()
+```
+
+Taking the differences in both expected and actual goals, by taking home scored - away scored, shows whether the home team won in terms of expected goals and actual goals. Positive expected goal diff means the home team is expected to win, and positive actual goal diff means the team did win. 
+
+Hence, I see an upset as when the expected goal diff and the actual goal diff have opposite signs. In particular, if the not only are different signs but that the actual goal diff was much larger, this could mean a bigger upset, and hence I made the `upset` metric in terms of the ratio. 
+
+Let's check out some data for my favourite team, Liverpool FC
+
+```{r liverpool opposition performance analysis}
+## Upsets for Liverpool?
+data_upsets %>% filter(Home == 'Liverpool' | Away == 'Liverpool') %>% select(Home, Away, `homexg-awayxg`, `home-away`, actualtopredicted) %>% arrange(Home, Away) %>% head()
+
+## Performed better than expected VS performed worse than expected 
+liv_upsets <- data_upsets %>% 
+  filter(Home == 'Liverpool' | Away == 'Liverpool') %>% select(HomeGoals, AwayGoals, Home, Away, `homexg-awayxg`, `home-away`, actualtopredicted,Season_End_Year) %>% 
+  mutate(Opposition = ifelse(Home == "Liverpool", Away, Home)) %>% 
+  select(Opposition, actualtopredicted) %>%
+  group_by(Opposition) %>% 
+  summarise(avg_actualtopred = mean(actualtopredicted))
+
+## Regress?
+# - first -- change the contrasts such that we get all opposition effects, and the intercept now becomes the average outcome instead of with respect to some base category/ reference category
+liv_upsets$Opposition <-as.factor(liv_upsets$Opposition)
+## regress the upset ratio to each of the oppositions
+liv_xg_model <- lm(avg_actualtopred ~ Opposition, 
+   data = liv_upsets)
+
+## Check coefficients to see performance over oppositions
+liv_xg_model$coefficients
+levels(liv_upsets$Opposition)[1] ## Hence the base category is Arsenal
+```
+
+
+```{r basic visualisations}
+#############################################
+## Time series for number of goals 
+week_totalgoals <- data1  %>% 
+  select(Time, Week, Total_goals) %>% 
+  group_by(Week) %>% 
+  summarise(total_goals_week = mean(Total_goals)) %>% 
+  arrange(Week)
+
+## Add in confidence intervals using normality (use t distribution)
+confidence_intervals <- data1 %>%
+  group_by(Week) %>%
+  summarise(lower_ci = mean(Total_goals) - qt(0.975, n() - 1) * (sd(Total_goals) / sqrt(n())),
+            upper_ci = mean(Total_goals) + qt(0.975, n() - 1) * (sd(Total_goals) / sqrt(n())))
+
+## Merge the total_goals_week column into confidence_intervals
+confidence_intervals <- confidence_intervals %>% 
+  left_join(week_totalgoals, by = "Week")
+
+#############################################
+## Ggplot for weekly mean goal count
+ggplot(data = week_totalgoals, aes(y = total_goals_week, x = Week)) + geom_point(color = 'red') +
+  geom_line() +
+  geom_ribbon(data = confidence_intervals, aes(x = Week,
+                                               ymin = lower_ci,
+                                               ymax = upper_ci),
+              fill = 'lightblue', alpha = 0.4) + 
+  labs(y = "Mean goals per week") +
+  geom_abline(slope = 0, intercept=mean(week_totalgoals$total_goals_week),
+              color = 'darkgreen')
+
+#############################################
+## Histogram for number of goals scored (distribution of goals) across seasons 
+data1 %>% select(Season_End_Year, Total_goals) %>%
+  ggplot(aes(fill = as.factor(Season_End_Year), x = Total_goals)) +
+  geom_density(position = 'identity', alpha = 0.6) +
+    scale_x_continuous(breaks = seq(0, max(data1$Total_goals), by = 1))+
+  labs(title = "Distribution of goals over seasons",
+       x = 'Goal counts',
+       fill = "Seasons")
+
+#############################################
+## Histogram for number of goals scored
+data1 %>% select(Season_End_Year, Total_goals) %>%
+  ggplot(aes(x = Total_goals)) +
+  geom_histogram(aes(y = ..density..), binwidth = .5, fill = 'darkblue') +
+  scale_x_continuous(breaks = seq(0, max(data1$Total_goals), by = 1)) +
+  theme_gray()
+
+
+
+
+```
+
+```{r poisson model for number of goals}
+## Fit a poisson using MLE
+total_goals <- data1 %>% dplyr::select(Total_goals)
+poisson_fit <- MASS::fitdistr(as.numeric(unlist(total_goals)), 'poisson')
+
+## This is the same as just finding the mean (MLE)
+pois_rate <- mean(unlist(total_goals))
+poisson_fit
+
+######### Plot the histogram and the Poisson density on top
+
+## First, use dpois to get the density across a range of x values (i.e. density for each number of goals, since discrete PMF)
+x_values <- 0:11
+fitted_poisson_density <- dpois(lambda = pois_rate, x = x_values)
+# Save as a df for easier plotting on ggplot
+fitted_pois_df <- data.frame(fitted_poisson_density, x_values)
+
+## Plot both histogram and the fitted poisson 
+ggplot()+
+  geom_histogram(data = data1, aes(x = Total_goals, y = ..density..),
+                 position = 'identity',
+                 binwidth = 1, 
+                 fill = 'lightblue',
+                 color = 'black', 
+                 alpha = 0.7) +
+  geom_point(data = fitted_pois_df, aes(y = fitted_poisson_density, 
+                                x = x_values,color = 'Fitted Poisson'),
+             
+            size = 2)+
+  geom_line(data = fitted_pois_df, aes(y = fitted_poisson_density, 
+                                x = x_values),
+            color = 'orange', 
+            size = .7) +
+  theme_bw() +
+  labs(title = 'Distribution of total goals', 
+       y = 'Density',
+       x = 'Total goals per match') +
+  scale_color_manual(values = 'red', 
+                     guide = guide_legend(title = 'Modelling')) +
+  scale_x_continuous(breaks = 0:12)
+
+```
+
+The poisson fit for the distribution of total goals per match looks like a decent fit, with the mean being between 2 and 3. 
+
+Due to the ability of the Poisson model to capture the number of goals, we can extent this to the GLM framework and use a Poisson GLM to try to model the goals. For this I will try to replicate the Poisson GLM model done by [dashee87](https://dashee87.github.io/data%20science/football/r/predicting-football-results-with-statistical-modelling/)
+
+Importantly, we want to reshape the data such that for every game, there will now be two rows: one for the home team and one for the away team, and now the new variable `home` will be a binary variable that is either 0 or 1 (therefore a doubling of the number of rows).
+
+This allows us to properly model the number of goals scored as a function of the `home` indicator. 
+
+```{r poisson model for total number of goals}
+## Step 1 -- reorganise the table such that we capture the goals as a single column, and add a home binary variable, same as Dashee87
+
+## Save reshaper function as a function 
+reshape_data <- function(dataframe) {
+  return(rbind(data.frame(goals=dataframe$HomeGoals,
+             team=dataframe$Home, ## the team that scored the goals (home)
+             opponent=dataframe$Away,
+             home=1,
+             xg = dataframe$Home_xG),
+             data.frame(goals=dataframe$AwayGoals,
+             team=dataframe$Away, ## the team that scores the goals (away)
+             opponent=dataframe$Home,
+             home=0, 
+             xg = dataframe$Away_xG)))
+}
+
+data1_reshaped <- reshape_data(data1)
+
+## Step 2 -- direct the pipeline into the GLM
+poisson_model <- data1_reshaped %>% ## pipe into GLM model 
+  glm(goals ~ ., family = poisson(link = log), 
+      data = .)
+
+## Get the fitted GLM results 
+summary(poisson_model)
+
+## Home advantage estimate?
+home_adv_coeff <-poisson_model$coefficients[names(poisson_model$coefficients) == 'home']
+
+names(home_adv_coeff) <- NULL
+
+```
+
+Since this is a Poisson model, the linear effects are on the log(#goals), hence to get the effect on the true #goals we need to exponentiate the coefficient. 
+
+In this case, the multiplicative effect of being at home, on average and all else constant, is `r exp(home_adv_coeff)*100` % on the number of goals scored. 
+
+Since the variables are categorical, we need to remember that the coefficients represent the change in average outcome of a team *with respect to the base category*, which is Arsenal. 
+
+xG is clearly a strong predictor of the number of goals. 
+
+With more data, we could consider adding in interaction terms. For example, the home team effect of Liverpool may be much stronger than another club. In this case, using the same coefficient for the home effect across all clubs may be unfair. 
+
+```{r more data prev seasons}
+## With the current data from 2019 to 2022 seasons
+## Interactions 
+poisson_model_2 <- data1_reshaped %>% ## pipe into GLM model 
+  glm(goals ~ home*team, family = poisson(link = log), 
+      data = .)
+
+## Summary 
+summary(poisson_model_2)
+
+#################################################################
+## Use more data from previous seasons
+data2 <- worldfootballR::fb_match_results(country = "ENG", gender = "M", season_end_year = c(2010:2022))
+
+head(data2)
+nrow(data2) ## there are 19 games a season for 20 teams, hence 380 games a season in total
+## Since there are 13 seasons, then we have 13*380
+
+## Reshape the data so that we can run it through the GLM 
+data2_reshaped <- reshape_data(data2)
+
+poisson_model_3 <- data2_reshaped %>% ## pipe into GLM model 
+  glm(goals ~ home*team, family = poisson(link = log), 
+      data = .)
+
+summary(poisson_model_3)
+```
+Even with including more data (13 seasons), we fail to get statistical significance for the interaction term between home effect and the various clubs. This possibly is due to the random nature of football, with goals being something that is very hard to predict due to too many factors being at play. 
+
+## xG vs Actual goals?
+```{r goals against xg plot}
+data1_reshaped %>% 
+  select(goals, xg) %>%
+  ggplot() +
+  geom_jitter(aes(x = xg, y = goals)) + ## since the goals is discrete, many points will be overlapping, therefore good to use jitter
+  geom_smooth(aes(x = xg, y = goals, color = 'Linear fit'), method = 'lm') +
+  geom_line(data = data.frame(x = 0:6, y = 0:6, label = 'Theoretical line'), 
+            aes(x = x, y = y, color = label), linetype = 'dashed', size = 1 ) +
+  scale_color_manual(values = c('red', 'blue', 'black'), 
+                     labels = c('Linear fit', 'Theoretical line'), 
+                     guide = guide_legend(override.aes = list(linetype = c('solid', 'dashed')))) +
+  labs(color = '', ## Add a legend label for the color variable used to distinguish the lines
+       title = 'Does XG truly predict goals?')+ 
+  scale_x_continuous(breaks = 1:8) +
+  scale_y_continuous(breaks = 1:8)
+```
+
+
+## Does Liverpool have statistically significant different results with different referees?
+
+## What is the home ground advantage for Liverpool (or for all clubs)
+
+```{r Liverpool only}
+Liverpool_2018_2021 <- data2 %>% filter(Home == "Liverpool" | Away == "Liverpool")
+
+## Create Win, Draw, Lost dummy(binary) columns for Liverpool 
+Liverpool_2018_2021$'Win' <- (Liverpool_2018_2021$Home == "Liverpool" & (Liverpool_2018_2021$HomeGoals > Liverpool_2018_2021$AwayGoals))|(Liverpool_2018_2021$Away == "Liverpool" &( Liverpool_2018_2021$HomeGoals < Liverpool_2018_2021$AwayGoals))
+
+Liverpool_2018_2021$`Win` <- as.integer(Liverpool_2018_2021$`Win`)
+
+Liverpool_2018_2021$'Draw' <- as.integer(Liverpool_2018_2021$HomeGoals == Liverpool_2018_2021$AwayGoals)
+
+Liverpool_2018_2021$'Loss' <- as.integer((!Liverpool_2018_2021$Win) &(!Liverpool_2018_2021$Draw))
+
+## Check 
+table(Liverpool_2018_2021$`Win`)
+table(rowSums(Liverpool_2018_2021[c("Win", "Draw", "Loss")])) ## Dummy variables all add to one (one hot vector)
+
+## Liverpool
+Liverpool_2018_2021 <- Liverpool_2018_2021 %>% select(Season_End_Year, Home, HomeGoals, Away, AwayGoals, Referee)%>%
+  mutate(Opponent = if_else(Home == "Liverpool", Away, Home),
+         IsHomeTeam = if_else(Home == "Liverpool", 1, 0))
+#  select(-Home, -Away) # Remove original Home and Away columns if desired
+
+## Reshape it so that the focus of the dataset is on Liverpool
+Liverpool_reshaped <- Liverpool_2018_2021 %>%
+   mutate(LiverpoolWon = if_else((Home == "Liverpool" & HomeGoals > AwayGoals) | (Away == "Liverpool" & AwayGoals > HomeGoals), 1, 0)) 
+
+#######################################################
+## Predict Liverpool Win (Logistic model for Liverpool Win)
+
+liverpool_win_logitistic_model <- glm(LiverpoolWon ~ as.factor(Season_End_Year) + as.factor(Referee) + Opponent + IsHomeTeam, 
+    data = Liverpool_reshaped,
+    family = binomial(link = "logit"),
+    contrasts = list(Season_End_Year = "contr.treatment", Referee = "contr.treatment", Opponent = "contr.treatment"))
+
+summary(liverpool_win_logitistic_model)
+
+## Check reference categories 
+Liverpool_reshaped <- Liverpool_reshaped %>% mutate(Referee = as.factor(Referee),
+                              Opponent = as.factor(Opponent))
+
+levels(Liverpool_reshaped$Referee) ## Reference referee: Alan Wiley
+levels(Liverpool_reshaped$Opponent) ## Reference opponent: Arsenal
+```
+
+There is little significance, unfortunately, except one or two seasons, and a few oppositions (Norwich, etc). However, there is strong evidence of a Liverpool home advantage, which is in agreement with the 'Anfield home atmosphere' perception. 
+
+Take note that there are reference categories for the factorial variables, e.g. referee and opposition. 
+
+## Try some Bayesian modelling? (unsuccessful)
+
+Main Source: Leonardo Egidi (https://cran.r-project.org/web/packages/footBayes/vignettes/footBayes_a_rapid_guide.html#modeling-football-outcomes), 2022 
+
+It is known that the number of goals scored by both teams are generally correlated -- let us look at the past data to see if we can find some sort of correlation between the home and away sides. My off-the-bat theory was that there should be a positive correlation, since the more one side scores, the harder the other side would try to score to catch up and hopefully turn the tide around and win the game. 
+
+```{r}
+## correlation coefficients 
+correlation_by_season <- data1 %>% select(Home, Away, HomeGoals, AwayGoals, Season_End_Year) %>%
+  group_by(Season_End_Year) %>%
+  summarise(correlation = cor(HomeGoals, AwayGoals))
+
+## Method 1: my own -------------------------------------------------------------
+
+## ggplot, and add in the numeric coefficients for year on year 
+# data1 %>% select(Home, Away, HomeGoals, AwayGoals, Season_End_Year) %>%
+#   ggplot(aes(x = HomeGoals, y = AwayGoals, color = as.factor(Season_End_Year))) +
+#   geom_jitter() +
+#   labs(title = "2019:2022 - Away vs Home goals per game", 
+#        color = "Season") +
+#   geom_smooth(aes(x = HomeGoals, y = AwayGoals),
+#               method = 'lm', se = T, alpha = 0.5, linetype = 1, linewidth = .5) + 
+#   ## add geom text to add in the correlation data 
+#   geom_text(data = correlation_by_season, 
+#             aes(x = max(data1$HomeGoals), y = max(data1$AwayGoals), label = paste0("r = ", round(correlation, 2))),
+#             hjust = 1, vjust = 1, color = "black", size = 4,
+#             position = position_dodge(width = 1))
+# 
+## Method 2: chatgpt v1 -------------------------------------------------------------
+
+
+# Plot with correlation coefficients
+p <- data1 %>% 
+  select(Home, Away, HomeGoals, AwayGoals, Season_End_Year) %>%
+  ggplot(aes(x = HomeGoals, y = AwayGoals, color = as.factor(Season_End_Year))) +
+  geom_jitter() +
+  labs(title = "2019:2022 - Away vs Home goals per game", color = "Season") +
+  geom_smooth(aes(x = HomeGoals, y = AwayGoals),
+              method = 'lm', se = T, alpha = 0.5, linetype = 1, linewidth = .5)
+
+# Add correlation coefficients as separate text layers
+## Iteratively add each text containing each season's correlation coefficients 
+for (i in 1:nrow(correlation_by_season)) {
+  p <- p + 
+    geom_text(data = correlation_by_season[i, ],
+              aes(x = max(data1$HomeGoals), y = max(data1$AwayGoals), 
+                  label = paste0("r = ", round(correlation, 2), " season ", Season_End_Year)),
+              color = "black", size = 4,
+              hjust = 1, vjust = 1*i) ## keep adjusting the position each time - so that the corr coeffs do not overlap
+}
+
+# Display the plot
+p
+
+## =======================================================
+## Plot version 2 : To see each season more clearly
+
+data1 %>% 
+  select(Home, Away, HomeGoals, AwayGoals, Season_End_Year) %>%
+  ggplot(aes(x = HomeGoals, y = AwayGoals, color = as.factor(Season_End_Year))) +
+  geom_jitter()+
+  geom_smooth(method = 'lm')+
+  facet_grid(~Season_End_Year) +
+  labs(title = "2019:2022 - Away vs Home goals per game", color = "Season") 
+
+
+```
+
+
+```{r home and away goals using ggscatter}
+## Load ggpubr plotting functionality 
+#install.packages('ggpubr')
+library(ggpubr)
+
+## use ggscatter from the ggpubr library
+data1$Season_End_Year <- as.factor(data1$Season_End_Year)
+data1 %>% 
+  select(Home, Away, HomeGoals, AwayGoals, Season_End_Year) %>%
+  ggscatter(x = "HomeGoals", y = "AwayGoals",col = "Season_End_Year", palette = 'jco', 
+            add = 'reg.line', conf.int = T) +
+  stat_cor(aes(color = (Season_End_Year))) #+
+  #facet_wrap(~ Season_End_Year, ncol = 1)
+
+
+```
+ggscatter has nice functionalities that allows us to not only plot out each regression curve per season but also displays the correlation coefficient and also the assosicated p value. 
+
+Strangely enough, it looks like it is negatively correlated - could this be the result of some Simpson's paradox? After plotting out and differentiating the points across seasons, we can see from both plots that the correlations are indeed negative and are statistically significantly so (perhaps apart from 2021, where the correlation coefficient itself is close to 0 and the p value is pretty high - suggesting insufficient evidence to reject the null that the correlation coefficient isn't 0). 
+
+As argued in Leonardo's article, there should be some psychological effect on seeing your team being down by a few goals and the natural motivation to try to at least equalise. Despite our correlation coefficient most likely being negative in this case, we will nevertheless proceed the same way and use a **bivariate Poisson** distribution to capture the dependence parameter between the goals scored and the goals conceded per game. 
+
+For a bivariate Poisson distribution, unlike that of a univariate Poisson, we now need 2 more parameters, in total 3: 
+
+$$\lambda_1 - \text{Rate for first  variable} \\ \lambda_2 - \text{Rate for second variable} (bivariate) \\ \lambda_3 - \text{Correlation  coefficient}$$
+Hence we will be using a $BP(\lambda_1,\lambda_2,\lambda_3)$ model to capture the random but correlated nature of the home and away goals, and from the EDA, this third parameter should capture the negative relationship. 
+
+As Leonardo argues, we can estimate these parameters via MLE, and get Wald type confidence intervals for the estimates for static models, however when the parameter space grows, MLE becomes more computationally expensive and less reliable than Bayesian inference methods. 
+
+While MLE doesn't consider a prior and finds an estimate purely from the data itself (e.g. MLE for most parameters are the sample average, e.g. when estimating the probability parameter of a bernoulli distribution like a coin flip), and gives a single value to the parameter (fixed estimate) via the Frequentist method. On the other hand, Bayesian methods allow the parameter to be randomly distributed in the first place (distributed over an appropriate support, for example between 0 and 1 for a probability parameter). 
+
+In Bayesian inference, we try to get the posterior distribution of the parameter of interest $\pi(\theta | \mathbf{Y})$, we need to first decide on a prior $\pi(\theta)$ and then factor in the data using the likelihood function $P(\mathbf{Y})$
+
+Unfortunately, in most cases, we cannot get closed form solutions for the posterior, and in these cases we need to use **Monte Carlo Markov Methods** where we draw dependent samples from a chain whose equilibrium distribution is the posterior distribution of interest. 
+
+We usually run the sampler for a long while before we start using the sampled data for estimation purposes - this is called the burn in period, where we are waiting for the sampler to converge to the true posterior distribution of interest. 
+
+Recall that there parameters of interest here are: 
+
+```{r, error = TRUE, echo=FALSE, include = FALSE}
+## Get the footbayes package from github
+#library(devtools)
+#install_github("LeoEgidi/footBayes")
+library(footBayes)
+
+## Other libraries 
+
+## Pacakge where Leonardo gets his data for Italian Serie A 2000-2001
+#install.packages("engsoccerdata")
+library(engsoccerdata)
+#data(package="engsoccerdata")    # lists datasets currently available
+engsoccerdata::italy
+
+## Save data from the Italian league
+italy_data <- as.data.frame(italy)
+summary(italy_data)
+
+## This is a comprehensive dataset - includes data from seasons from year 1929 to year 2015
+
+## Copying Leonardo's code
+italy_2000 <- subset(italy[, c(2,3,4,6,7)], ## this is to filer for only some columns of interest, and also to filter for season 2000
+                     Season =="2000")
+## Check 
+table(italy_2000$Season)
+
+###########################
+
+## Run the MCMC 
+
+n_iterations <- 200 ## number of MCMC interations -- generally the more the better convergence
+## stand_foot: Stan football modelling for the most famous models: double Poisson, bivariate Poisson, Skellam, Student T 
+## The function recognises datasets in the form : Season, home and away teams, home and away goals 
+
+```
+
+
+Unfortunately I couldn't get the Bayesian methods to work, but neverthless we have some MLE estimates to work with. We can see that in terms of attack and defence parameter estimates, traditionally strong teams such that AC and Inter Milan both have good stats (high attack and defence ratings). 
+
+
+```{r}
+mle_fit_italy2000 <- mle_foot(italy_2000, 
+                       model = "biv_pois", 
+                       interval = 'wald')
+                      #chains = 4,
+                       #iter = n_iterations) 
+
+
+
+mle_fit_italy2000$att
+mle_fit_italy2000$def
+mle_fit_italy2000$home
+mle_fit_italy2000$corr
+```
+
+The lack of confidence intervals could be due to the sample size. 
+Let us apply this same MLE modelling to our EPL data from 2019 to 2022. 
+
+```{r}
+## Check and match the same columns 
+colnames(italy_2000)
+
+## Prepare our data for the bivariate fitting 
+epl_2019_2022 <- data1 %>% select(Season_End_Year, Home, Away, HomeGoals, AwayGoals)
+
+## Fit the bivariate Poisson and get MLE 
+mle_fit_epl <- mle_foot(epl_2019_2022, 
+                       model = "biv_pois", 
+                       interval = 'wald')
+ 
+
+## Check results 
+## Attacking stats
+sort((mle_fit_epl$att)[,2])
+
+## Defensive stats
+sort((mle_fit_epl$def)[,2])
+
+## Correlation
+mle_fit_epl$corr
+mle_fit_epl$home
+```
+
+As expected, Liverpool and Mancity have the best stats for both attack and defence. 
+
+Comparing the coefficient between the Italian league during 2000, and our EPL during 2019 to 2022, we have `r paste(mle_fit_italy2000$corr[2], ' vs ', mle_fit_epl$corr[2]) `
+
+
